@@ -106,9 +106,10 @@ def remove_ansi(text: str) -> str: # アスキー文字の削除
 def run_zeroclaw(prompt: str) -> str: # ZeroClaw のシングル対話モードで送信
     try:
         result = subprocess.run(
-            ["/opt/homebrew/bin/zeroclaw", "agent", "-m", prompt],
+            ["zeroclaw", "agent", "-m", prompt],
             capture_output=True,
             text=True,
+            shell=True,
             timeout=600
         )
         output = remove_ansi(result.stdout)
