@@ -6,17 +6,24 @@
 
 import asyncio
 import concurrent.futures
+import json
+import os
 import re
+import sqlite3
 import subprocess
 import time
+from datetime import datetime
 
 # py-cord
 import discord
 from discord.ext import commands, tasks
 
+TOKEN = ""
 TASK = [None]
 stopped = [False]
-TOKEN = ""
+
+memory_db = os.path.join(os.path.expanduser("~"), ".zeroclaw", "memory.db")
+last_tag_file = os.path.join(os.path.expanduser("~"), ".zeroclaw", "last_tag.txt")
 
 class Client(commands.Bot):
     pass
@@ -24,10 +31,64 @@ class Client(commands.Bot):
 intents = discord.Intents.default()
 try:
     intents.message_content = True
-except:
+except Exception:
     pass
 client = Client(command_prefix="!", intents=intents, help_command=None)
 
+def tuple_to_str(_t_list):
+    re_list = []
+    for tx in _t_list:
+        if type(tx) == tuple:
+            tuple_to_str(tx)
+        else:
+            re_list.append(tx)
+    return '\n'.join(re_list)
+
+def save_memory(json_data, JSON_TAGS):
+    conn = sqlite3.connect(memory_db)
+    cur = conn.cursor()
+    JSON_TAGS.clear()
+    [JSON_TAGS.append(tag) for tag in json_data["tags"]]
+    cur.execute("""
+        INSERT INTO memories (task, code, result, success, summary, tags, reuse_hint, created_at)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+        """, (
+        json_data["task"],
+        json_data["code"],
+        json_data["result"],
+        json_data["success"],
+        json_data["summary"],
+        json.dumps(json_data["tags"]),
+        json_data["reuse_hint"],
+        datetime.now().isoformat()
+    ))
+
+    conn.commit()
+    conn.close()
+    return "タスク: {}\nコード: {}\n結果: {}\n成功: {}\n説明: {}\n再実行時のヒント: {}".format(
+        json_data["task"],
+            json_data["code"],
+            json_data["result"],
+            json_data["success"],
+            json_data["summary"],
+            json_data["reuse_hint"]), JSON_TAGS
+
+def search_memory(JSON_TAGS) -> list:
+    conn = sqlite3.connect(memory_db)
+    cur = conn.cursor()
+    results = []
+    try:
+        for tag in JSON_TAGS:
+            cur.execute("""
+            SELECT task, summary, code FROM memories
+            WHERE summary LIKE ? OR tags LIKE ?
+            ORDER BY id DESC LIMIT 3
+            """, (f"%{tag}%", f"%{tag}%"))
+            results.extend(cur.fetchall())
+        conn.close()
+        return results
+    except:
+        return []
 
 def clean_output(text: str) -> str: # INFO, WRN, DEBUGを消す
     text = remove_ansi(text)
@@ -44,36 +105,89 @@ def remove_ansi(text: str) -> str: # アスキー文字の削除
 
 def run_zeroclaw(prompt: str) -> str: # ZeroClaw のシングル対話モードで送信
     try:
-        result = subprocess.run('zeroclaw agent -m "{}"'.format(prompt),
+        result = subprocess.run(
+            ["/opt/homebrew/bin/zeroclaw", "agent", "-m", prompt],
             capture_output=True,
             text=True,
-            timeout=600,
-            shell=True,
+            timeout=600
         )
         output = remove_ansi(result.stdout)
         return clean_output(output) or "⚠️ 出力なし"
+
     except Exception as e:
         return f"エラー: {e}"
 
+def fix_code_block(text):
+    return text.replace('"""', '').strip()
+
+def extract_json(text):
+    match = re.search(r'\{.*\}', text, re.DOTALL)
+    if match:
+        data = json.loads(match.group())
+        if data:
+            data["code"] = fix_code_block(data["code"])
+            return data
+    return None
 
 class Ai(commands.Cog):
+    def __init__(self):
+        self.JSON_TAGS = []
+        if not os.path.exists(memory_db):
+            _conn = sqlite3.connect(memory_db)
+            _cur = _conn.cursor()
+
+            _cur.execute("""
+            CREATE TABLE IF NOT EXISTS memories (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                task TEXT,
+                code TEXT,
+                result TEXT,
+                success BOOLEAN,
+                summary TEXT,
+                tags TEXT,
+                reuse_hint TEXT,
+                created_at TEXT
+            )
+            """)
+
+            _conn.commit()
+            _conn.close()
 
     @discord.slash_command(name="set_learn", description="AIに学習をさせます")
-    async def set_learn(self, cx: discord.ApplicationContext, text: str, minutes: int) -> None: # 学習機能(自動で学習させたい内容と更新時間(分)))
+    async def set_learn(self, cx: discord.ApplicationContext, text: str, minutes: int): # 学習機能(自動で学習させたい内容と更新時間(分))
         try:
-            await cx.response.send_message(content='AIに学習を設定させました。', ephemeral=True)
+            await cx.response.send_message(content='AIに自動学習を設定させました。', ephemeral=True)
         except:
             pass
         task = tasks.loop(minutes=minutes)(self.__set_Cron) # タスクとして関数登録
         TASK[0] = task
         task.start(cx, text)
 
-    async def __set_Cron(self, ctx, text): # タスク化する関数
+    async def __set_Cron(self, ctx, text):
+        if os.path.exists(last_tag_file):
+            self.JSON_TAGS = open(last_tag_file, 'r', encoding='utf-8').read().split(',')
+        if len(self.JSON_TAGS) != 0:
+            mem = search_memory(self.JSON_TAGS)
+            if len(mem) != 0:
+                prompt = "過去の学習:\n{}\n\nこれを参考に以下のタスクを実行してください\n\n{}".format('\n'.join(tuple_to_str(mem)), text)
+            else:
+                prompt = "{}".format(text)
+        else:
+            prompt = "{}".format(text)
         loop = asyncio.get_event_loop()
-        output = await loop.run_in_executor(None, run_zeroclaw, text)
-        await ctx.send(content=output)
+        output = await loop.run_in_executor(None, run_zeroclaw, prompt)
+        try:
+            json_data = extract_json(output)
+            text, json_tags = save_memory(json_data, self.JSON_TAGS)
+        except:
+            text = "⚠️ 出力なし"
+            json_tags = []
+        self.JSON_TAGS = json_tags
+        with open(last_tag_file, 'w', encoding='utf-8') as _tag:
+            _tag.write(','.join(json_tags))
+        await ctx.send(content=text)
 
-    @discord.slash_command(name="set_stop", description="学習を停止します")
+    @discord.slash_command(name="set_stop", description="学習を停止します。")
     async def set_stop(self, cx: discord.ApplicationContext) -> None: # 学習を停止するコマンド
         try:
             TASK[0].stop()
@@ -91,7 +205,7 @@ class Ai(commands.Cog):
 
 @client.event
 async def on_ready():
-    await client.change_presence(activity=discord.Game('BOTが正常に起動ました'))
+    await client.change_presence(activity=discord.Game('正常に稼働中 v1.0'))
     print(f"ログイン: {client.user}")
 
 
@@ -104,7 +218,7 @@ async def on_message(message): # メッセージから指示の取得
     if not (is_reply or is_mention):
         return
     prompt = message.content
-    await message.channel.send("思考中......")
+    await message.channel.send("思考中.........")
     loop = asyncio.get_event_loop()
     response = await loop.run_in_executor(None, run_zeroclaw, prompt)
     await message.channel.send(response)
